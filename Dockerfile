@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
     curl \
+    nano \
+    vim \
     && rm -rf /var/lib/apt/lists/*
 
 # Crear directorio de trabajo
