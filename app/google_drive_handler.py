@@ -21,7 +21,7 @@ class GoogleDriveHandler:
         'https://www.googleapis.com/auth/spreadsheets'
     ]
     
-    def __init__(self, credentials_path: str = '/app/credentials/google-credentials.json'):
+    def __init__(self, credentials_path: str = '/app/credentials/resenas-credentials.json'):
         """
         Inicializa el handler de Google Drive
         
@@ -42,7 +42,7 @@ class GoogleDriveHandler:
             if not os.path.exists(self.credentials_path):
                 raise FileNotFoundError(
                     f"Archivo de credenciales no encontrado: {self.credentials_path}\n"
-                    "Por favor, coloca el archivo google-credentials.json en la carpeta credentials/"
+                    "Por favor, coloca el archivo resenas-credentials.json en la carpeta credentials/"
                 )
             
             # Cargar credenciales

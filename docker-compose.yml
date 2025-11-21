@@ -13,7 +13,7 @@ services:
       - ./credentials:/app/credentials
       - ./logs:/app/logs
     environment:
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/google-credentials.json
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/resenas-credentials.json
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MAX_WORKERS=${MAX_WORKERS:-3}
     networks:
