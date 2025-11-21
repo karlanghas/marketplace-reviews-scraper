@@ -13,7 +13,7 @@ services:
       - ./logs:/app/logs
     environment:
       - PYTHONPATH=/app  # ← IMPORTANTE
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/resenas-credentials.json
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/resenas_credentials.json
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MAX_WORKERS=${MAX_WORKERS:-3}
     networks:
