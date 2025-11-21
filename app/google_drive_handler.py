@@ -21,7 +21,7 @@ class GoogleDriveHandler:
         'https://www.googleapis.com/auth/spreadsheets'
     ]
     
-    def __init__(self, credentials_path: str = '/app/credentials/resenas-credentials.json'):
+    def __init__(self, credentials_path: str = '/app/credentials/resenas_credentials.json'):
         """
         Inicializa el handler de Google Drive
         
