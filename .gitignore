@@ -41,10 +41,6 @@ env/
 logs/
 *.log
 
-# Credentials
-credentials/
-!config/*.json
-
 # Docker
 docker-compose.override.yml
 
