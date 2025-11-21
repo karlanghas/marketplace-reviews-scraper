@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  marketplace-reviews:
+    build: .
+    container_name: marketplace-reviews-scraper
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app
+      - ./config:/app/config
+      - ./credentials:/app/credentials
+      - ./logs:/app/logs
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/google-credentials.json
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_WORKERS=${MAX_WORKERS:-3}
+    networks:
+      - marketplace-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  marketplace-network:
+    driver: bridge
+
+volumes:
+  logs:

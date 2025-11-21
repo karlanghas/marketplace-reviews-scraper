@@ -1,0 +1,49 @@
+# Stack configuration for Portainer
+# Use este archivo para desplegar en Portainer
+
+version: '3.8'
+
+services:
+  marketplace-reviews:
+    image: marketplace-reviews-scraper:latest
+    container_name: marketplace-reviews-scraper
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Monta el código para desarrollo (quitar en producción)
+      - /path/to/marketplace-reviews-scraper/app:/app/app
+      - /path/to/marketplace-reviews-scraper/config:/app/config
+      # Monta credenciales (IMPORTANTE: ajusta la ruta)
+      - /path/to/marketplace-reviews-scraper/credentials:/app/credentials
+      # Monta logs
+      - /path/to/marketplace-reviews-scraper/logs:/app/logs
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/google-credentials.json
+      - LOG_LEVEL=INFO
+      - MAX_WORKERS=3
+    networks:
+      - marketplace-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.marketplace-reviews.rule=Host(`reviews.local`)"
+      - "traefik.http.services.marketplace-reviews.loadbalancer.server.port=8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  marketplace-network:
+    driver: bridge
+
+# Instrucciones de despliegue en Portainer:
+# 1. Ve a Stacks → Add Stack
+# 2. Nombra el stack: "marketplace-reviews"
+# 3. Selecciona "Web editor"
+# 4. Pega este archivo
+# 5. IMPORTANTE: Ajusta las rutas de los volumenes (reemplaza /path/to/)
+# 6. En "Environment variables" agrega las necesarias
+# 7. Click en "Deploy the stack"
