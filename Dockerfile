@@ -30,11 +30,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copiar aplicación
-COPY app/ ./app/
-COPY config/ ./config/
-
-# Crear directorio para credenciales
-RUN mkdir -p /app/credentials
+COPY . .
 
 # Exponer puerto
 EXPOSE 5050
