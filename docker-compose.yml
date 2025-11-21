@@ -8,9 +8,8 @@ services:
     ports:
       - "5050:5050"
     volumes:
-      - ./app:/app/app
       - ./config:/app/config
-      - ./credentials:/app/credentials
+      - ./credentials:/app/credentials:ro 
       - ./logs:/app/logs
     environment:
       - PYTHONPATH=/app  # ← IMPORTANTE
