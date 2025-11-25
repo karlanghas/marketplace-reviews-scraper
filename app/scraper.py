@@ -1,5 +1,5 @@
 """
-Módulo para scraping de reseñas de marketplace (Fixed for Raspberry Pi 5 + Docker)
+Módulo para scraping de reseñas de marketplace (Versión Anti-Bot / Stealth)
 """
 import asyncio
 import json
@@ -10,10 +10,11 @@ import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service # Necesario para indicar la ruta del driver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from loguru import logger
 import time
+import random
 
 from app.google_drive_handler import GoogleDriveHandler
 
@@ -21,87 +22,81 @@ class ReviewScraper:
     
     def __init__(self, drive_handler: GoogleDriveHandler):
         self.drive_handler = drive_handler
-        # Configuración explícita para Docker en Raspberry Pi
         self.chrome_service = Service("/usr/bin/chromedriver")
         self.chrome_options = self._setup_chrome_options()
     
     def _setup_chrome_options(self) -> Options:
         chrome_options = Options()
-        
-        # IMPORTANTE: Decirle dónde está el binario del navegador
         chrome_options.binary_location = "/usr/bin/chromium"
         
-        # Argumentos críticos para Docker
-        chrome_options.add_argument('--headless') # Ejecutar sin interfaz gráfica
-        chrome_options.add_argument('--no-sandbox') # Necesario para root en Docker
-        chrome_options.add_argument('--disable-dev-shm-usage') # Evita errores de memoria compartida
+        # --- CONFIGURACIÓN ANTI-DETECCIÓN ---
+        chrome_options.add_argument('--headless') 
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
         
-        # User Agent para parecer un navegador real y no un bot
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36')
+        # 1. Ocultar que es Selenium
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled") 
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
+        
+        # 2. Tamaño de ventana realista
+        chrome_options.add_argument('--window-size=1920,1080')
+        
+        # 3. User Agent de PC real (Windows)
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         
         return chrome_options
     
     async def scrape_from_spreadsheet(self, spreadsheet_name: str, sheet_name: str, drive_folder_id: Optional[str] = None) -> Dict[str, Any]:
+        # (Lógica idéntica a versiones anteriores)
         try:
-            logger.info("Leyendo planilla de Google Sheets...")
+            logger.info("--- INICIANDO CICLO DE SCRAPING ---")
             records = self.drive_handler.read_spreadsheet(spreadsheet_name, sheet_name)
-            
             try:
                 column_letter = self.drive_handler.find_column_letter(spreadsheet_name, sheet_name, 'ARCHIVOJSON')
             except:
                 column_letter = "E"
             
             results = []
-            
             for idx, record in enumerate(records, start=2):
                 try:
                     product_name = record.get('PRODUCTO', f'producto_{idx}')
                     product_url = record.get('URL', '')
-                    
                     if not product_url: continue
                     
-                    logger.info(f">>> Procesando: {product_name}")
-                    
-                    # Llamada al scraping
+                    logger.info(f"Procesando: {product_name}")
                     reviews = await self.scrape_product_reviews(product_url, product_name)
                     
                     if reviews:
                         sheet_title = self._sanitize_sheet_name(product_name)
-                        # Guardar en nueva hoja
                         self.drive_handler.save_reviews_to_new_sheet(spreadsheet_name, sheet_title, reviews)
                         msg = f"OK: {sheet_title} ({len(reviews)} reseñas)"
-                        logger.info(msg)
                     else:
-                        msg = "Sin reseñas (Check log)"
-                        logger.warning(f"No se obtuvieron reseñas para {product_name}")
+                        msg = "Falló: 0 reseñas (Posible bloqueo o selector)"
                         
-                    # Actualizar estado en planilla principal
+                    logger.info(f"Resultado: {msg}")
                     self.drive_handler.update_cell(spreadsheet_name, sheet_name, idx, column_letter, msg)
                     results.append({'producto': product_name, 'count': len(reviews)})
                     
-                    # Pausa respetuosa
-                    await asyncio.sleep(2)
+                    # Pausa aleatoria para parecer humano
+                    await asyncio.sleep(random.uniform(3, 6))
                     
                 except Exception as e:
-                    logger.error(f"Error procesando item {idx}: {e}")
+                    logger.error(f"Error item: {e}")
                     continue
-                    
             return {'status': 'success', 'results': results}
         except Exception as e:
-            logger.error(f"Error general scraping: {e}")
+            logger.error(f"Error general: {e}")
             raise
 
     async def scrape_product_reviews(self, product_url: str, product_name: str) -> List[Dict[str, Any]]:
         marketplace = self._detect_marketplace(product_url)
-        
         if marketplace == 'mercadolibre':
             return await self._scrape_mercadolibre_selenium(product_url)
         elif marketplace == 'amazon':
-            # Implementar lógica similar si se requiere
-            return await self._scrape_mercadolibre_selenium(product_url) 
-        else:
-            return []
+             return await self._scrape_mercadolibre_selenium(product_url) # Reusa lógica ML por ahora
+        return []
 
     def _detect_marketplace(self, url: str) -> str:
         domain = urlparse(url).netloc.lower()
@@ -113,114 +108,104 @@ class ReviewScraper:
         reviews = []
         driver = None
         try:
-            logger.info("Iniciando Selenium con driver local...")
-            
-            # INICIALIZACIÓN CORRECTA PARA RASPBERRY/DOCKER
+            logger.info("Lanzando navegador...")
             driver = webdriver.Chrome(service=self.chrome_service, options=self.chrome_options)
             
+            # Script para evadir detección de webdriver
+            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            
+            logger.info(f"Navegando a: {url[:60]}...")
             driver.get(url)
-            time.sleep(3) # Esperar carga inicial
+            time.sleep(random.uniform(3, 5))
+            
+            # DEBUG: Ver título para saber si cargó bien
+            logger.info(f"Título de página: {driver.title}")
 
-            # 1. BUSCAR ENLACE A "VER TODAS"
+            # 1. INTENTAR IR A "VER TODAS"
             reviews_url = None
             try:
-                # Buscar enlaces que contengan palabras clave
-                links = driver.find_elements(By.CSS_SELECTOR, "a")
+                # Buscar en el DOM enlaces relevantes
+                # ML suele usar 'ui-pdp-reviews__see-more'
+                links = driver.find_elements(By.TAG_NAME, "a")
                 for link in links:
-                    href = link.get_attribute('href')
-                    if href and ('/reviews/' in href or 'opiniones' in href):
-                        text = link.text.lower()
-                        if 'todas' in text or 'all' in text or 'ver' in text:
-                            reviews_url = href
-                            break
-                
-                if not reviews_url:
-                    # Intento específico botón ML moderno
-                    try:
-                        btn = driver.find_element(By.CSS_SELECTOR, "a.ui-pdp-reviews__see-more")
-                        reviews_url = btn.get_attribute('href')
-                    except: pass
-            except Exception as e:
-                logger.warning(f"No se encontró enlace de reseñas: {e}")
+                    h = link.get_attribute('href')
+                    if h and ('/reviews/' in h or 'opiniones' in h):
+                        reviews_url = h
+                        break
+            except: pass
 
-            # 2. NAVEGAR Y SCROLL
             if reviews_url:
-                logger.info(f"Navegando a reseñas completas: {reviews_url}")
+                logger.info("Enlace 'Ver todas' encontrado. Navegando...")
                 driver.get(reviews_url)
                 time.sleep(3)
                 
-                # Scroll loop
-                last_height = driver.execute_script("return document.body.scrollHeight")
-                for i in range(10): # Scroll 10 veces máximo
+                # Scroll para cargar
+                for _ in range(5):
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                     time.sleep(1.5)
-                    new_height = driver.execute_script("return document.body.scrollHeight")
-                    if new_height == last_height:
-                        # Intentar botón "Cargar más" si existe
-                        try:
-                            btn_more = driver.find_element(By.CSS_SELECTOR, "button.ui-review-view__more-options-button")
-                            btn_more.click()
-                            time.sleep(1.5)
-                        except:
-                            break 
-                    last_height = new_height
             else:
-                logger.info("Extrayendo solo reseñas de la página principal (no se halló 'ver todas')")
+                logger.warning("No se halló enlace 'Ver todas'. Usando página principal.")
+                # Si estamos en la página principal, debemos bajar hasta las opiniones para que carguen
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+                time.sleep(1)
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight - 1000);")
+                time.sleep(2)
 
-            # 3. EXTRAER DATOS (Usando BeautifulSoup sobre el HTML renderizado)
+            # 2. EXTRACCIÓN CON SELECTORES AMPLIOS
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             
-            # Selectores variados para encontrar tarjetas
-            cards = soup.select('article.ui-review-card')
-            if not cards: cards = soup.select('div.ui-review-card')
-            if not cards: cards = soup.select('div.ui-pdp-reviews__comments__content') # Página producto
+            # Lista de selectores de ML (viejos y nuevos)
+            selectors = [
+                'article.ui-review-card',             # ML Página reseñas
+                'div.ui-review-card',                 # Variación
+                'div.ui-pdp-reviews__comments__content', # ML Página producto
+                'div.ui-pdp-reviews__comments',       # ML Contenedor general
+                'div[class*="review-card"]',          # Genérico
+            ]
             
-            logger.info(f"Tarjetas encontradas: {len(cards)}")
+            cards = []
+            for sel in selectors:
+                found = soup.select(sel)
+                if found:
+                    logger.info(f"Selector exitoso: '{sel}' - Encontrados: {len(found)}")
+                    cards = found
+                    break
+            
+            if not cards:
+                logger.error("DEBUG: HTML Dump (Primeros 500 chars):")
+                logger.error(soup.prettify()[:500])
 
             for card in cards:
                 try:
                     # Contenido
                     content = self._extract_text(card, ['p'], re.compile('content|text|comment'))
-                    if not content: 
-                        content = card.get_text(strip=True)
-                        if len(content) > 500: content = content[:500]
+                    if not content: content = card.get_text(" ", strip=True)[:500]
+                    
+                    # Evitar tarjetas vacías o de carga
+                    if len(content) < 5: continue
 
-                    # Rating (Estrellas SVG)
-                    rating = 0
-                    stars_div = card.select_one('div.ui-review-capability__rating')
-                    if not stars_div: stars_div = card.select_one('span.ui-review-capability__rating')
-                    
-                    if stars_div:
-                        # Contar iconos SVG
-                        svgs = stars_div.find_all('svg')
-                        if svgs: rating = float(len(svgs))
-                    
-                    # Título
-                    title = self._extract_text(card, ['h4', 'h3'], re.compile('title'))
+                    # Rating
+                    rating = 5.0
+                    stars = card.select('svg.ui-review-capability__rating__icon')
+                    if stars: rating = float(len(stars))
                     
                     # Fecha
                     date = self._extract_text(card, ['time', 'span'], re.compile('date|created'))
-
-                    # Autor (a veces no existe)
-                    author = "Usuario ML" # Default
-
-                    if content:
-                        reviews.append({
-                            'contenido': content,
-                            'rating': rating if rating > 0 else "",
-                            'fecha': date,
-                            'autor': author,
-                            'titulo': title,
-                            'marketplace': 'Mercado Libre'
-                        })
-                except Exception:
-                    continue
+                    
+                    reviews.append({
+                        'contenido': content,
+                        'rating': rating,
+                        'fecha': date,
+                        'autor': "Usuario ML",
+                        'titulo': self._extract_text(card, ['h4'], re.compile('title')),
+                        'marketplace': 'Mercado Libre'
+                    })
+                except: continue
 
         except Exception as e:
             logger.error(f"Error Selenium: {e}")
         finally:
-            if driver:
-                driver.quit()
+            if driver: driver.quit()
         
         return reviews
 
@@ -235,5 +220,4 @@ class ReviewScraper:
     @staticmethod
     def _sanitize_sheet_name(name: str) -> str:
         name = re.sub(r'[\[\]\*\?\:\\\/]', '', str(name))
-        name = name.replace('\n', ' ').replace('\r', '').replace('\t', ' ')
         return name[:95].strip()
