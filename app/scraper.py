@@ -228,6 +228,7 @@ async def _scrape_mercadolibre_selenium(self, url: str) -> List[Dict[str, Any]]:
             logger.error(f"Error Selenium: {e}")
         finally:
             if driver: driver.quit()
+
     def _extract_text(self, element, tags, attrs=None) -> str:
         try:
             for tag in tags:
