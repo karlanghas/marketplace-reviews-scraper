@@ -104,91 +104,102 @@ class ReviewScraper:
         elif 'amazon' in domain: return 'amazon'
         return 'generic'
 
-    async def _scrape_mercadolibre_selenium(self, url: str) -> List[Dict[str, Any]]:
+async def _scrape_mercadolibre_selenium(self, url: str) -> List[Dict[str, Any]]:
         reviews = []
         driver = None
         try:
             logger.info("Lanzando navegador...")
             driver = webdriver.Chrome(service=self.chrome_service, options=self.chrome_options)
             
-            # Script para evadir detección de webdriver
+            # Evasión básica
             driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
-            logger.info(f"Navegando a: {url[:60]}...")
             driver.get(url)
-            time.sleep(random.uniform(3, 5))
-            
-            # DEBUG: Ver título para saber si cargó bien
-            logger.info(f"Título de página: {driver.title}")
+            time.sleep(random.uniform(2, 4))
+            logger.info(f"Página producto cargada: {driver.title[:30]}...")
 
             # 1. INTENTAR IR A "VER TODAS"
             reviews_url = None
             try:
-                # Buscar en el DOM enlaces relevantes
-                # ML suele usar 'ui-pdp-reviews__see-more'
                 links = driver.find_elements(By.TAG_NAME, "a")
                 for link in links:
                     h = link.get_attribute('href')
                     if h and ('/reviews/' in h or 'opiniones' in h):
-                        reviews_url = h
-                        break
+                        # Priorizar el que dice "todas"
+                        if 'todas' in link.text.lower() or 'all' in link.text.lower():
+                            reviews_url = h
+                            break
+                        # Si no hay uno que diga "todas", guardamos el primero que veamos como fallback
+                        if not reviews_url: reviews_url = h
             except: pass
 
             if reviews_url:
-                logger.info("Enlace 'Ver todas' encontrado. Navegando...")
+                logger.info("Navegando a página de reseñas...")
                 driver.get(reviews_url)
                 time.sleep(3)
-                
-                # Scroll para cargar
-                for _ in range(5):
+                # Scroll agresivo
+                for _ in range(6):
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                     time.sleep(1.5)
             else:
-                logger.warning("No se halló enlace 'Ver todas'. Usando página principal.")
-                # Si estamos en la página principal, debemos bajar hasta las opiniones para que carguen
+                logger.warning("Quedándonos en página principal (no link reseñas).")
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-                time.sleep(1)
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight - 1000);")
                 time.sleep(2)
 
-            # 2. EXTRACCIÓN CON SELECTORES AMPLIOS
+            # 2. PARSEO POR INGENIERÍA INVERSA (BUSCAR ESTRELLAS -> ENCONTRAR PADRE)
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             
-            # Lista de selectores de ML (viejos y nuevos)
-            selectors = [
-                'article.ui-review-card',             # ML Página reseñas
-                'div.ui-review-card',                 # Variación
-                'div.ui-pdp-reviews__comments__content', # ML Página producto
-                'div.ui-pdp-reviews__comments',       # ML Contenedor general
-                'div[class*="review-card"]',          # Genérico
-            ]
+            # Buscamos cualquier elemento que parezca un contenedor de rating
+            # ui-review-capability__rating es el estándar histórico, pero buscamos variaciones
+            star_containers = soup.find_all(class_=re.compile(r'rating|stars'))
             
-            cards = []
-            for sel in selectors:
-                found = soup.select(sel)
-                if found:
-                    logger.info(f"Selector exitoso: '{sel}' - Encontrados: {len(found)}")
-                    cards = found
-                    break
+            potential_cards = []
             
-            if not cards:
-                logger.error("DEBUG: HTML Dump (Primeros 500 chars):")
-                logger.error(soup.prettify()[:500])
+            for star_box in star_containers:
+                # El contenedor de estrellas suele estar dentro de la tarjeta.
+                # Subimos hasta encontrar un 'article' o un 'div' que parezca la tarjeta
+                parent = star_box.find_parent('article')
+                if not parent:
+                    # Si no es article, buscamos el div padre que contenga texto largo
+                    parent = star_box.find_parent('div', class_=re.compile(r'card|review|content'))
+                
+                if parent and parent not in potential_cards:
+                    # Validar que el padre tenga texto largo (para no agarrar el header del producto)
+                    if len(parent.get_text(strip=True)) > 20: 
+                        potential_cards.append(parent)
 
-            for card in cards:
+            # Si la estrategia de estrellas falla, usamos la búsqueda bruta de articles
+            if not potential_cards:
+                logger.info("Estrategia estrellas falló, buscando etiquetas <article>...")
+                potential_cards = soup.find_all('article')
+
+            logger.info(f"Candidatos a reseña encontrados: {len(potential_cards)}")
+
+            for card in potential_cards:
                 try:
-                    # Contenido
-                    content = self._extract_text(card, ['p'], re.compile('content|text|comment'))
-                    if not content: content = card.get_text(" ", strip=True)[:500]
+                    # --- EXTRACCIÓN ROBUSTA ---
+                    full_text = card.get_text(" ", strip=True)
                     
-                    # Evitar tarjetas vacías o de carga
-                    if len(content) < 5: continue
+                    # Ignorar tarjetas que son del producto y no reseñas (muy cortas o sin palabras clave)
+                    if len(full_text) < 10: continue
 
                     # Rating
                     rating = 5.0
-                    stars = card.select('svg.ui-review-capability__rating__icon')
-                    if stars: rating = float(len(stars))
+                    # Contamos SVGs dentro de ESTA tarjeta
+                    svgs = card.find_all('svg')
+                    # Filtrar SVGs pequeños (estrellas) vs iconos grandes
+                    star_svgs = [s for s in svgs if int(s.get('width', 10) or 10) < 20]
+                    if star_svgs: 
+                        rating = float(len(star_svgs))
+                        # A veces ML pone 5 estrellas siempre y cambia el color. 
+                        # Asumimos 5 si hay 5 iconos, corregir esto requiere CSS computed style (lento).
                     
+                    # Contenido: Intentar buscar parrafo <p>
+                    content = self._extract_text(card, ['p'], re.compile('content|text|comment'))
+                    if not content:
+                        # Si no hay <p>, limpiamos el texto completo quitando la fecha y titulo si es posible
+                        content = full_text[:600] # Fallback sucio pero útil
+
                     # Fecha
                     date = self._extract_text(card, ['time', 'span'], re.compile('date|created'))
                     
@@ -196,19 +207,27 @@ class ReviewScraper:
                         'contenido': content,
                         'rating': rating,
                         'fecha': date,
-                        'autor': "Usuario ML",
-                        'titulo': self._extract_text(card, ['h4'], re.compile('title')),
+                        'autor': "Usuario ML", # ML oculta autores casi siempre ahora
+                        'titulo': self._extract_text(card, ['h4', 'h3'], re.compile('title')),
                         'marketplace': 'Mercado Libre'
                     })
-                except: continue
+                except Exception as e:
+                    continue
+            
+            # Deduplicar por contenido (a veces agarra duplicados por la logica de padres)
+            unique_reviews = []
+            seen_content = set()
+            for r in reviews:
+                if r['contenido'] not in seen_content:
+                    seen_content.add(r['contenido'])
+                    unique_reviews.append(r)
+            
+            return unique_reviews
 
         except Exception as e:
             logger.error(f"Error Selenium: {e}")
         finally:
             if driver: driver.quit()
-        
-        return reviews
-
     def _extract_text(self, element, tags, attrs=None) -> str:
         try:
             for tag in tags:
