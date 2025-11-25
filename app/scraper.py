@@ -11,44 +11,25 @@ import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from loguru import logger
 import time
 
 from app.google_drive_handler import GoogleDriveHandler
 
-
 class ReviewScraper:
     """Clase para scraping de reseñas de productos"""
     
     def __init__(self, drive_handler: GoogleDriveHandler):
-        """
-        Inicializa el scraper
-        
-        Args:
-            drive_handler: Handler de Google Drive
-        """
         self.drive_handler = drive_handler
         self.chrome_options = self._setup_chrome_options()
     
     def _setup_chrome_options(self) -> Options:
-        """
-        Configura opciones de Chrome para Raspberry Pi
-        
-        Returns:
-            Opciones de Chrome
-        """
         chrome_options = Options()
         chrome_options.add_argument('--headless')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--disable-software-rasterizer')
-        chrome_options.add_argument('--disable-extensions')
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36')
-        
         return chrome_options
     
     async def scrape_from_spreadsheet(
@@ -59,14 +40,6 @@ class ReviewScraper:
     ) -> Dict[str, Any]:
         """
         Procesa scraping desde una planilla de Google Sheets
-        
-        Args:
-            spreadsheet_name: Nombre de la planilla
-            sheet_name: Nombre de la hoja
-            drive_folder_id: ID de carpeta de destino (opcional)
-            
-        Returns:
-            Resultado del proceso
         """
         try:
             # Leer planilla
@@ -76,29 +49,26 @@ class ReviewScraper:
             if not records:
                 raise ValueError("No se encontraron registros en la planilla")
             
-            # Si no se especificó carpeta, usar la misma de la planilla
-            if not drive_folder_id:
-                drive_folder_id = self.drive_handler.get_folder_id_from_spreadsheet(spreadsheet_name)
-                logger.info(f"Usando carpeta de la planilla: {drive_folder_id}")
-            
-            # Buscar columna ARCHIVOJSON
-            column_letter = self.drive_handler.find_column_letter(
-                spreadsheet_name,
-                sheet_name,
-                'ARCHIVOJSON'
-            )
-            
+            # Intentar buscar la columna para actualizar el estado
+            # Si se llama ARCHIVOJSON, la usaremos para poner el nombre de la hoja creada
+            try:
+                column_letter = self.drive_handler.find_column_letter(
+                    spreadsheet_name, sheet_name, 'ARCHIVOJSON'
+                )
+            except:
+                # Si no existe, intentamos buscar una columna ESTADO o usamos la columna Z por defecto
+                column_letter = "E" 
+                logger.warning("No se encontró columna de salida, usando columna E por defecto")
+
             results = []
             
             # Procesar cada producto
-            for idx, record in enumerate(records, start=2):  # Start at 2 because row 1 is headers
+            for idx, record in enumerate(records, start=2):
                 try:
-                    # Extraer información del producto
                     product_name = record.get('PRODUCTO', f'producto_{idx}')
                     product_url = record.get('URL', '')
                     
                     if not product_url:
-                        logger.warning(f"URL vacía para producto: {product_name}")
                         continue
                     
                     logger.info(f"Procesando: {product_name}")
@@ -106,54 +76,44 @@ class ReviewScraper:
                     # Extraer reseñas
                     reviews = await self.scrape_product_reviews(product_url, product_name)
                     
-                    # Crear estructura JSON
-                    json_data = {
-                        'producto': product_name,
-                        'url': product_url,
-                        'fecha_extraccion': datetime.now().isoformat(),
-                        'total_reseñas': len(reviews),
-                        'reseñas': reviews
-                    }
-                    
-                    # Generar nombre de archivo
-                    safe_name = self._sanitize_filename(product_name)
-                    file_name = f"{safe_name}.json"
-                    
-                    # Subir a Google Drive
-                    logger.info(f"Subiendo archivo: {file_name}")
-                    file_id = self.drive_handler.upload_json_file(
-                        json_data,
-                        file_name,
-                        drive_folder_id
-                    )
-                    
-                    # Actualizar columna ARCHIVOJSON
+                    if reviews:
+                        # Generar nombre válido para la hoja (Pestaña)
+                        # Google Sheets limita nombres a 100 chars y prohíbe ciertos caracteres
+                        sheet_title = self._sanitize_sheet_name(product_name)
+                        
+                        # Guardar reseñas en una nueva hoja dentro de la MISMA planilla
+                        self.drive_handler.save_reviews_to_new_sheet(
+                            spreadsheet_name,
+                            sheet_title,
+                            reviews
+                        )
+                        
+                        status_message = f"Hoja: {sheet_title} ({len(reviews)} reseñas)"
+                        logger.info(f"Guardado en hoja: {sheet_title}")
+                    else:
+                        status_message = "Sin reseñas encontradas"
+
+                    # Actualizar celda en la hoja principal
                     self.drive_handler.update_cell(
                         spreadsheet_name,
                         sheet_name,
                         idx,
                         column_letter,
-                        file_name
+                        status_message
                     )
                     
                     results.append({
                         'producto': product_name,
-                        'archivo': file_name,
-                        'reseñas_extraidas': len(reviews),
-                        'file_id': file_id
+                        'hoja_creada': sheet_title if reviews else None,
+                        'reseñas_extraidas': len(reviews)
                     })
-                    
-                    logger.info(f"✓ Completado: {product_name} - {len(reviews)} reseñas")
                     
                     # Pausa para evitar rate limiting
                     await asyncio.sleep(2)
                     
                 except Exception as e:
                     logger.error(f"Error procesando producto {product_name}: {str(e)}")
-                    results.append({
-                        'producto': product_name,
-                        'error': str(e)
-                    })
+                    results.append({'producto': product_name, 'error': str(e)})
                     continue
             
             return {
@@ -165,57 +125,27 @@ class ReviewScraper:
         except Exception as e:
             logger.error(f"Error en scraping desde planilla: {str(e)}")
             raise
-    
-    async def scrape_product_reviews(
-        self,
-        product_url: str,
-        product_name: str
-    ) -> List[Dict[str, Any]]:
-        """
-        Extrae reseñas de un producto
         
-        Args:
-            product_url: URL del producto
-            product_name: Nombre del producto
-            
-        Returns:
-            Lista de reseñas
-        """
-        try:
-            # Detectar marketplace
-            marketplace = self._detect_marketplace(product_url)
-            logger.info(f"Marketplace detectado: {marketplace}")
-            
-            if marketplace == 'mercadolibre':
-                return await self._scrape_mercadolibre(product_url)
-            elif marketplace == 'amazon':
-                return await self._scrape_amazon(product_url)
-            else:
-                return await self._scrape_generic(product_url)
-                
-        except Exception as e:
-            logger.error(f"Error extrayendo reseñas de {product_name}: {str(e)}")
-            return []
-    
+    async def scrape_product_reviews(self, product_url: str, product_name: str) -> List[Dict[str, Any]]:
+        # (Implementación igual al archivo original)
+        # Copia aquí la lógica de detección y llamada a scrapers específicos
+        marketplace = self._detect_marketplace(product_url)
+        if marketplace == 'mercadolibre':
+            return await self._scrape_mercadolibre(product_url)
+        elif marketplace == 'amazon':
+            return await self._scrape_amazon(product_url)
+        else:
+            return await self._scrape_generic(product_url)
+
     def _detect_marketplace(self, url: str) -> str:
-        """
-        Detecta el marketplace según la URL
-        
-        Args:
-            url: URL del producto
-            
-        Returns:
-            Nombre del marketplace
-        """
         domain = urlparse(url).netloc.lower()
-        
         if 'mercadolibre' in domain or 'mercadolivre' in domain:
             return 'mercadolibre'
         elif 'amazon' in domain:
             return 'amazon'
         else:
             return 'generic'
-    
+
     async def _scrape_mercadolibre(self, url: str) -> List[Dict[str, Any]]:
         """
         Extrae reseñas de Mercado Libre
@@ -463,22 +393,18 @@ class ReviewScraper:
         except:
             pass
         return ''
-    
+
     @staticmethod
-    def _sanitize_filename(filename: str) -> str:
+    def _sanitize_sheet_name(name: str) -> str:
         """
-        Limpia nombre de archivo para que sea válido
-        
-        Args:
-            filename: Nombre original
-            
-        Returns:
-            Nombre sanitizado
+        Limpia nombre para ser usado como nombre de hoja en Google Sheets
+        Limitaciones: Máx 100 caracteres, no permitir [] * ? : / \
         """
-        # Remover caracteres no válidos
-        filename = re.sub(r'[<>:"/\\|?*]', '', filename)
-        # Reemplazar espacios
-        filename = filename.replace(' ', '_')
-        # Limitar longitud
-        filename = filename[:100]
-        return filename
+        # Caracteres prohibidos en Excel/Sheets
+        name = re.sub(r'[\[\]\*\?\:\\\/]', '', name)
+        # Eliminar saltos de línea y tabs
+        name = name.replace('\n', ' ').replace('\r', '').replace('\t', ' ')
+        # Truncar a 95 caracteres para dejar margen
+        if len(name) > 95:
+            name = name[:95] + "..."
+        return name.strip()
