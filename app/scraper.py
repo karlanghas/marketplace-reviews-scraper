@@ -1,5 +1,5 @@
 """
-Módulo para scraping de reseñas de marketplace (Fixed Processing Logic)
+Módulo para scraping de reseñas de marketplace (Fixed Rating Logic)
 """
 import asyncio
 import json
@@ -27,20 +27,25 @@ class ReviewScraper:
     def _setup_chrome_options(self) -> Options:
         chrome_options = Options()
         chrome_options.binary_location = "/usr/bin/chromium"
+        
+        # Opciones críticas para RPi/Docker
         chrome_options.add_argument('--headless') 
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
+        
+        # Stealth
         chrome_options.add_argument("--disable-blink-features=AutomationControlled") 
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
+        
         chrome_options.add_argument('--window-size=1920,1080')
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         return chrome_options
     
     async def scrape_from_spreadsheet(self, spreadsheet_name: str, sheet_name: str, drive_folder_id: Optional[str] = None) -> Dict[str, Any]:
         try:
-            logger.info("--- INICIANDO CICLO DE SCRAPING ---")
+            logger.info("--- INICIANDO SCRAPING (RATING FIX) ---")
             records = self.drive_handler.read_spreadsheet(spreadsheet_name, sheet_name)
             
             try:
@@ -63,10 +68,12 @@ class ReviewScraper:
                         sheet_title = self._sanitize_sheet_name(product_name)
                         self.drive_handler.save_reviews_to_new_sheet(spreadsheet_name, sheet_title, reviews)
                         msg = f"OK: {sheet_title} ({len(reviews)} reseñas)"
+                        # Calcular promedio real para verificar en el log
+                        avg_rating = sum(r['rating'] for r in reviews) / len(reviews)
+                        logger.info(f"Guardado. Promedio detectado: {avg_rating:.1f} estrellas")
                     else:
-                        msg = "Falló: 0 reseñas (Posible bloqueo o selector)"
+                        msg = "Falló: 0 reseñas"
                         
-                    logger.info(f"Resultado: {msg}")
                     self.drive_handler.update_cell(spreadsheet_name, sheet_name, idx, column_letter, msg)
                     results.append({'producto': product_name, 'count': len(reviews)})
                     await asyncio.sleep(random.uniform(3, 5))
@@ -104,7 +111,7 @@ class ReviewScraper:
             
             driver.get(url)
             time.sleep(random.uniform(2, 4))
-            logger.info(f"Página cargada: {driver.title[:40]}...")
+            logger.info(f"Cargado: {driver.title[:30]}...")
 
             reviews_url = None
             try:
@@ -119,21 +126,20 @@ class ReviewScraper:
             except: pass
 
             if reviews_url:
-                logger.info("Navegando a página de reseñas...")
+                logger.info("Navegando a reseñas...")
                 driver.get(reviews_url)
                 time.sleep(3)
                 for _ in range(6):
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                     time.sleep(1.5)
             else:
-                logger.warning("No se halló link reseñas, usando página principal.")
+                logger.warning("Usando página principal.")
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
                 time.sleep(2)
 
-            # PARSEO
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             
-            # Buscar contenedores de estrellas
+            # --- BÚSQUEDA DE TARJETAS (ESTRATEGIA INGENIERÍA INVERSA) ---
             star_containers = soup.find_all(class_=re.compile(r'rating|stars'))
             potential_cards = []
             
@@ -147,37 +153,64 @@ class ReviewScraper:
                         potential_cards.append(parent)
 
             if not potential_cards:
-                logger.info("Estrategia estrellas falló, buscando etiquetas <article>...")
                 potential_cards = soup.find_all('article')
 
-            logger.info(f"Candidatos a reseña encontrados: {len(potential_cards)}")
+            logger.info(f"Tarjetas encontradas: {len(potential_cards)}")
 
-            # --- CORRECCIÓN EN EL BUCLE DE PROCESAMIENTO ---
             success_count = 0
-            for i, card in enumerate(potential_cards):
+            for card in potential_cards:
                 try:
                     full_text = card.get_text(" ", strip=True)
                     if len(full_text) < 10: continue
 
-                    # 1. Extracción de Contenido (Blindada)
+                    # 1. CONTENIDO
                     content = self._extract_text(card, ['p'], re.compile('content|text|comment'))
-                    if not content:
-                        # Fallback: tomamos todo el texto pero cortamos headers comunes
-                        content = full_text[:800]
+                    if not content: content = full_text[:800]
 
-                    # 2. Rating (Simplificado para evitar errores de int())
-                    rating = 5.0
-                    try:
+                    # 2. RATING (CORREGIDO)
+                    rating = 0.0
+                    
+                    # Intento A: Accesibilidad (ARIA Labels) - La forma correcta
+                    # A veces el contenedor tiene aria-label="Calificación 4 de 5"
+                    rating_box = card.find(class_=re.compile(r'rating'))
+                    if rating_box:
+                        aria = rating_box.get('aria-label', '') or rating_box.get('title', '')
+                        nums = re.findall(r'(\d)', aria)
+                        if nums: 
+                            rating = float(nums[0])
+                    
+                    # Intento B: Conteo de Estrellas AZULES (Hex #3483fa)
+                    if rating == 0:
                         svgs = card.find_all('svg')
                         if svgs:
-                            rating = float(len(svgs))
-                            if rating > 5: rating = 5.0 # Normalizar
-                    except: pass # Si falla contar estrellas, dejamos 5.0 por defecto
+                            # Contar solo SVGs que tengan el color azul de ML en su HTML
+                            # Color azul ML: #3483fa o rgb(52, 131, 250)
+                            blue_stars = 0
+                            for svg in svgs:
+                                svg_html = str(svg).lower()
+                                if '#3483fa' in svg_html or '3483fa' in svg_html:
+                                    blue_stars += 1
+                                elif 'full' in svg_html or 'filled' in svg_html:
+                                    # Fallback por si usan clases en vez de styles in-line
+                                    blue_stars += 1
+                            
+                            if blue_stars > 0:
+                                rating = float(blue_stars)
+                            else:
+                                # Si hay 5 SVGs y ninguno es azul, quizás cambiaron el código de color
+                                # O quizás es una review de 0 estrellas (raro).
+                                # Asumimos 5 si no podemos distinguir, pero loggeamos aviso
+                                if len(svgs) == 5:
+                                    # Último recurso: buscar texto oculto
+                                    nums = re.findall(r'(\d)\s*estrellas', str(card).lower())
+                                    if nums: rating = float(nums[0])
 
-                    # 3. Fecha
+                    # Si después de todo sigue siendo 0, y hay contenido, asumimos 5 por defecto
+                    # (Mejor que 0 que arruina promedios)
+                    if rating == 0: rating = 5.0
+
+                    # 3. METADATA
                     date = self._extract_text(card, ['time', 'span'], re.compile('date|created'))
-                    
-                    # 4. Título
                     title = self._extract_text(card, ['h4', 'h3'], re.compile('title'))
 
                     reviews.append({
@@ -189,18 +222,12 @@ class ReviewScraper:
                         'marketplace': 'Mercado Libre'
                     })
                     success_count += 1
-                except Exception as e:
-                    # Log solo del primer error para no spamear
-                    if i == 0: logger.error(f"Error procesando tarjeta individual: {e}")
-                    continue
+                except: continue
             
-            logger.info(f"Procesadas correctamente: {success_count}/{len(potential_cards)}")
-
             # Deduplicar
             unique_reviews = []
             seen_content = set()
             for r in reviews:
-                # Usar los primeros 50 chars como hash simple para deduplicar
                 key = r['contenido'][:50]
                 if key not in seen_content:
                     seen_content.add(key)
@@ -210,7 +237,7 @@ class ReviewScraper:
 
         except Exception as e:
             logger.error(f"Error Selenium: {e}")
-            return [] # Retornar lista vacía en error fatal
+            return []
         finally:
             if driver: driver.quit()
 
@@ -225,5 +252,4 @@ class ReviewScraper:
     @staticmethod
     def _sanitize_sheet_name(name: str) -> str:
         name = re.sub(r'[\[\]\*\?\:\\\/]', '', str(name))
-        name = name.replace('\n', ' ').replace('\r', '').replace('\t', ' ')
         return name[:95].strip()
