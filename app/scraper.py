@@ -11,6 +11,9 @@ import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from loguru import logger
 import time
 
@@ -29,7 +32,8 @@ class ReviewScraper:
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36')
+        chrome_options.add_argument('--window-size=1920,1080')
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         return chrome_options
     
     async def scrape_from_spreadsheet(
@@ -38,31 +42,23 @@ class ReviewScraper:
         sheet_name: str,
         drive_folder_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Procesa scraping desde una planilla de Google Sheets
-        """
         try:
-            # Leer planilla
             logger.info("Leyendo planilla de Google Sheets...")
             records = self.drive_handler.read_spreadsheet(spreadsheet_name, sheet_name)
             
             if not records:
                 raise ValueError("No se encontraron registros en la planilla")
             
-            # Intentar buscar la columna para actualizar el estado
-            # Si se llama ARCHIVOJSON, la usaremos para poner el nombre de la hoja creada
             try:
                 column_letter = self.drive_handler.find_column_letter(
                     spreadsheet_name, sheet_name, 'ARCHIVOJSON'
                 )
             except:
-                # Si no existe, intentamos buscar una columna ESTADO o usamos la columna Z por defecto
                 column_letter = "E" 
-                logger.warning("No se encontró columna de salida, usando columna E por defecto")
+                logger.warning("No se encontró columna ARCHIVOJSON, usando columna E por defecto")
 
             results = []
             
-            # Procesar cada producto
             for idx, record in enumerate(records, start=2):
                 try:
                     product_name = record.get('PRODUCTO', f'producto_{idx}')
@@ -71,71 +67,55 @@ class ReviewScraper:
                     if not product_url:
                         continue
                     
-                    logger.info(f"Procesando: {product_name}")
+                    logger.info(f">>> Procesando URL: {product_url}")
                     
-                    # Extraer reseñas
                     reviews = await self.scrape_product_reviews(product_url, product_name)
                     
                     if reviews:
-                        # Generar nombre válido para la hoja (Pestaña)
-                        # Google Sheets limita nombres a 100 chars y prohíbe ciertos caracteres
                         sheet_title = self._sanitize_sheet_name(product_name)
-                        
-                        # Guardar reseñas en una nueva hoja dentro de la MISMA planilla
                         self.drive_handler.save_reviews_to_new_sheet(
                             spreadsheet_name,
                             sheet_title,
                             reviews
                         )
-                        
-                        status_message = f"Hoja: {sheet_title} ({len(reviews)} reseñas)"
-                        logger.info(f"Guardado en hoja: {sheet_title}")
+                        status_message = f"OK: Hoja '{sheet_title}' ({len(reviews)} reseñas)"
+                        logger.info(status_message)
                     else:
-                        status_message = "Sin reseñas encontradas"
+                        status_message = "Sin reseñas encontradas (Revisar selectores o bloqueo)"
+                        logger.warning(f"No se extrajeron reseñas para: {product_name}")
 
-                    # Actualizar celda en la hoja principal
                     self.drive_handler.update_cell(
-                        spreadsheet_name,
-                        sheet_name,
-                        idx,
-                        column_letter,
-                        status_message
+                        spreadsheet_name, sheet_name, idx, column_letter, status_message
                     )
                     
                     results.append({
                         'producto': product_name,
-                        'hoja_creada': sheet_title if reviews else None,
                         'reseñas_extraidas': len(reviews)
                     })
                     
-                    # Pausa para evitar rate limiting
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(3) # Pausa amigable
                     
                 except Exception as e:
                     logger.error(f"Error procesando producto {product_name}: {str(e)}")
                     results.append({'producto': product_name, 'error': str(e)})
                     continue
             
-            return {
-                'status': 'success',
-                'productos_procesados': len(results),
-                'resultados': results
-            }
+            return {'status': 'success', 'resultados': results}
             
         except Exception as e:
             logger.error(f"Error en scraping desde planilla: {str(e)}")
             raise
-        
+    
     async def scrape_product_reviews(self, product_url: str, product_name: str) -> List[Dict[str, Any]]:
-        # (Implementación igual al archivo original)
-        # Copia aquí la lógica de detección y llamada a scrapers específicos
         marketplace = self._detect_marketplace(product_url)
+        logger.info(f"Marketplace detectado: {marketplace}")
+        
         if marketplace == 'mercadolibre':
             return await self._scrape_mercadolibre(product_url)
         elif marketplace == 'amazon':
             return await self._scrape_amazon(product_url)
         else:
-            return await self._scrape_generic(product_url)
+            return await self._scrape_with_selenium(product_url)
 
     def _detect_marketplace(self, url: str) -> str:
         domain = urlparse(url).netloc.lower()
@@ -146,265 +126,235 @@ class ReviewScraper:
         else:
             return 'generic'
 
+    # --- MERCADO LIBRE SCRAPER ---
     async def _scrape_mercadolibre(self, url: str) -> List[Dict[str, Any]]:
-        """
-        Extrae reseñas de Mercado Libre
-        
-        Args:
-            url: URL del producto
-            
-        Returns:
-            Lista de reseñas
-        """
         reviews = []
-        
         try:
-            # Usar requests para obtener la página
+            # 1. Intentar con requests (más rápido)
             headers = {
-                'User-Agent': 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
             }
+            response = requests.get(url, headers=headers, timeout=20)
             
-            response = requests.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
-            
+            # Si nos redirigen al login, fallamos
+            if "login" in response.url:
+                logger.warning("MercadoLibre redirigió a login. Se requiere Selenium.")
+                return await self._scrape_with_selenium(url)
+
             soup = BeautifulSoup(response.content, 'html.parser')
             
-            # Buscar sección de opiniones/reseñas
-            # Nota: Los selectores pueden variar según el país de Mercado Libre
-            review_elements = soup.find_all('article', class_=re.compile('ui-review'))
+            # Buscar el contenedor de opiniones. 
+            # Estrategia: Buscar artículos de review o contenedores genéricos de comentarios
+            review_elements = soup.find_all('article', class_=re.compile(r'ui-review|review-card'))
             
             if not review_elements:
-                # Intentar selectores alternativos
-                review_elements = soup.find_all('div', class_=re.compile('review'))
+                # Fallback: buscar divs que parezcan reviews
+                review_elements = soup.select('div.ui-pdp-reviews__comments__content')
             
-            for review_el in review_elements:
-                try:
-                    # Extraer datos de la reseña
-                    rating = self._extract_rating(review_el)
-                    title = self._extract_text(review_el, ['h3', 'h4'], 'review-title')
-                    content = self._extract_text(review_el, ['p', 'div'], 'review-content')
-                    author = self._extract_text(review_el, ['span', 'div'], 'review-author')
-                    date = self._extract_text(review_el, ['time', 'span'], 'review-date')
-                    
-                    review = {
-                        'rating': rating,
-                        'titulo': title,
-                        'contenido': content,
-                        'autor': author,
-                        'fecha': date,
-                        'marketplace': 'Mercado Libre'
-                    }
-                    
-                    reviews.append(review)
-                    
-                except Exception as e:
-                    logger.debug(f"Error extrayendo reseña individual: {str(e)}")
-                    continue
+            logger.info(f"Elementos de reseña encontrados (Requests): {len(review_elements)}")
+
+            for el in review_elements:
+                r = self._parse_ml_element(el)
+                if r['contenido']: # Solo agregar si tiene contenido
+                    reviews.append(r)
             
-            # Si no se encontraron reseñas con el método anterior, intentar con Selenium
+            # Si requests falló, intentar Selenium
             if not reviews:
-                logger.info("No se encontraron reseñas con requests, intentando con Selenium...")
-                reviews = await self._scrape_with_selenium(url)
-            
-            logger.info(f"Extraídas {len(reviews)} reseñas de Mercado Libre")
-            
+                logger.info("Requests no trajo reseñas, intentando Selenium para ML...")
+                return await self._scrape_with_selenium(url)
+
         except Exception as e:
-            logger.error(f"Error en scraping de Mercado Libre: {str(e)}")
-        
+            logger.error(f"Error ML Requests: {e}")
+            return await self._scrape_with_selenium(url)
+            
         return reviews
-    
+
+    def _parse_ml_element(self, el) -> Dict[str, Any]:
+        """Helper para extraer datos de un elemento HTML de ML"""
+        # Selectores de contenido
+        content = self._extract_text(el, ['p'], re.compile(r'content|comment|text'))
+        if not content: content = el.get_text(strip=True)
+        
+        # Selectores de rating
+        rating = 0
+        rating_span = el.find('span', class_=re.compile(r'rating|star'))
+        if rating_span:
+            txt = rating_span.get_text()
+            # Buscar números
+            nums = re.findall(r'\d+', txt)
+            if nums: rating = float(nums[0])
+        
+        # Si no encontramos rating numérico, buscar estrellas visuales (clases css)
+        if not rating:
+            stars = el.find_all(class_=re.compile(r'full-star|ui-review-capability-rating__icon'))
+            if stars: rating = len(stars)
+
+        return {
+            'rating': rating,
+            'titulo': self._extract_text(el, ['h3', 'h4'], re.compile(r'title')),
+            'contenido': content,
+            'autor': self._extract_text(el, ['span', 'div'], re.compile(r'author|user')),
+            'fecha': self._extract_text(el, ['time', 'span'], re.compile(r'date|created')),
+            'marketplace': 'Mercado Libre'
+        }
+
+    # --- AMAZON SCRAPER ---
     async def _scrape_amazon(self, url: str) -> List[Dict[str, Any]]:
-        """
-        Extrae reseñas de Amazon
-        
-        Args:
-            url: URL del producto
-            
-        Returns:
-            Lista de reseñas
-        """
+        # Amazon bloquea requests casi siempre. Mejor ir directo a una estrategia mixta
+        # pero intentaremos requests con headers muy completos primero.
         reviews = []
-        
         try:
-            # Amazon requiere más cuidado para evitar detección
             headers = {
-                'User-Agent': 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36',
-                'Accept-Language': 'es-ES,es;q=0.9'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept-Language': 'es-ES,es;q=0.9',
+                'referer': 'https://www.google.com/'
             }
-            
-            response = requests.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
-            
+            response = requests.get(url, headers=headers, timeout=20)
+            if response.status_code != 200:
+                logger.warning(f"Amazon bloqueó requests (Status {response.status_code}). Usando Selenium.")
+                return await self._scrape_with_selenium(url)
+                
             soup = BeautifulSoup(response.content, 'html.parser')
             
-            # Buscar reseñas en Amazon
-            review_elements = soup.find_all('div', {'data-hook': 'review'})
+            # Selectores clásicos de Amazon
+            review_divs = soup.find_all('div', {'data-hook': 'review'})
             
-            for review_el in review_elements:
-                try:
-                    rating_el = review_el.find('i', {'data-hook': 'review-star-rating'})
-                    rating = self._extract_amazon_rating(rating_el)
-                    
-                    title = self._extract_text(review_el, ['a'], {'data-hook': 'review-title'})
-                    content = self._extract_text(review_el, ['span'], {'data-hook': 'review-body'})
-                    author = self._extract_text(review_el, ['span'], {'class': 'a-profile-name'})
-                    date = self._extract_text(review_el, ['span'], {'data-hook': 'review-date'})
-                    
-                    review = {
-                        'rating': rating,
-                        'titulo': title,
-                        'contenido': content,
-                        'autor': author,
-                        'fecha': date,
-                        'marketplace': 'Amazon'
-                    }
-                    
+            for div in review_divs:
+                review = {
+                    'titulo': self._extract_text(div, ['a'], {'data-hook': 'review-title'}),
+                    'contenido': self._extract_text(div, ['span'], {'data-hook': 'review-body'}),
+                    'rating': self._extract_amazon_rating(div),
+                    'autor': self._extract_text(div, ['span'], 'a-profile-name'),
+                    'fecha': self._extract_text(div, ['span'], {'data-hook': 'review-date'}),
+                    'marketplace': 'Amazon'
+                }
+                if review['contenido']:
                     reviews.append(review)
-                    
-                except Exception as e:
-                    logger.debug(f"Error extrayendo reseña de Amazon: {str(e)}")
-                    continue
             
-            logger.info(f"Extraídas {len(reviews)} reseñas de Amazon")
+            logger.info(f"Reseñas encontradas Amazon (Requests): {len(reviews)}")
             
+            if not reviews:
+                 return await self._scrape_with_selenium(url)
+                 
         except Exception as e:
-            logger.error(f"Error en scraping de Amazon: {str(e)}")
-        
+            logger.error(f"Error Amazon: {e}")
+            return await self._scrape_with_selenium(url)
+            
         return reviews
-    
-    async def _scrape_generic(self, url: str) -> List[Dict[str, Any]]:
-        """
-        Scraper genérico para otros sitios
-        
-        Args:
-            url: URL del producto
-            
-        Returns:
-            Lista de reseñas
-        """
-        return await self._scrape_with_selenium(url)
-    
+
+    # --- SELENIUM GENÉRICO (FALLBACK) ---
     async def _scrape_with_selenium(self, url: str) -> List[Dict[str, Any]]:
-        """
-        Scraping usando Selenium para sitios dinámicos
-        
-        Args:
-            url: URL del producto
-            
-        Returns:
-            Lista de reseñas
-        """
         reviews = []
         driver = None
-        
         try:
+            logger.info(f"Iniciando Selenium para: {url[:50]}...")
             driver = webdriver.Chrome(options=self.chrome_options)
             driver.get(url)
             
-            # Esperar a que cargue
-            time.sleep(3)
+            # Esperar carga inicial
+            time.sleep(4)
             
-            # Scroll para cargar contenido dinámico
+            # Scroll agresivo para cargar lazy-load
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+            time.sleep(1)
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
             
-            # Obtener HTML
             html = driver.page_source
             soup = BeautifulSoup(html, 'html.parser')
             
-            # Buscar reseñas con selectores comunes
-            review_selectors = [
-                'div[class*="review"]',
-                'article[class*="review"]',
-                'div[class*="opinion"]',
-                'div[class*="comentario"]'
+            # Estrategia "Escopeta": Buscar cualquier bloque de texto que parezca reseña
+            # 1. Buscar contenedores específicos si sabemos el sitio
+            detected_reviews = []
+            
+            # Selectores genéricos muy comunes
+            selectors = [
+                'div[data-hook="review"]',         # Amazon
+                'article.ui-review',               # ML
+                'div.ui-pdp-reviews__comments',    # ML Moderno
+                'div[class*="review-content"]',
+                'div[class*="comment-content"]',
+                'div[itemprop="review"]'
             ]
             
-            for selector in review_selectors:
-                elements = soup.select(selector)
+            for sel in selectors:
+                elements = soup.select(sel)
                 if elements:
-                    logger.info(f"Encontrados {len(elements)} elementos con selector: {selector}")
+                    logger.info(f"Selenium encontró {len(elements)} elementos con selector '{sel}'")
+                    detected_reviews = elements
                     break
             
-            # Procesar elementos encontrados
-            for el in elements[:50]:  # Limitar a 50 reseñas
-                try:
-                    text = el.get_text(strip=True)
-                    if len(text) > 20:  # Filtrar elementos muy cortos
-                        review = {
-                            'contenido': text[:500],  # Limitar longitud
-                            'rating': None,
-                            'titulo': '',
-                            'autor': '',
-                            'fecha': '',
-                            'marketplace': 'Generic'
-                        }
-                        reviews.append(review)
-                except:
-                    continue
-            
+            # Procesar lo encontrado
+            for el in detected_reviews:
+                text = el.get_text(" ", strip=True)
+                # Limpieza básica
+                if len(text) < 10: continue # Ignorar basura
+                
+                # Intentar parsear mejor
+                r_content = self._extract_text(el, ['p', 'span'], re.compile(r'body|content|text|comment'))
+                if not r_content: 
+                    # Si no encuentra contenido específico, tomar el texto del bloque pero limpiar
+                    r_content = text[:500] 
+
+                r_rating = 0
+                r_rating_txt = self._extract_text(el, ['span'], re.compile(r'rating|star'))
+                if r_rating_txt:
+                     nums = re.findall(r'(\d+)', r_rating_txt)
+                     if nums: r_rating = nums[0]
+
+                reviews.append({
+                    'contenido': r_content,
+                    'rating': r_rating,
+                    'fecha': self._extract_text(el, ['time', 'span'], re.compile(r'date')),
+                    'autor': self._extract_text(el, ['span', 'div'], re.compile(r'author|user|profile')),
+                    'titulo': '',
+                    'marketplace': self._detect_marketplace(url)
+                })
+
+            logger.info(f"Total reseñas extraídas con Selenium: {len(reviews)}")
+
         except Exception as e:
-            logger.error(f"Error en Selenium scraping: {str(e)}")
-        
+            logger.error(f"Error fatal Selenium: {str(e)}")
         finally:
             if driver:
                 driver.quit()
         
         return reviews
-    
-    def _extract_rating(self, element) -> Optional[float]:
-        """Extrae rating de un elemento"""
-        try:
-            rating_el = element.find('span', class_=re.compile('star|rating'))
-            if rating_el:
-                rating_text = rating_el.get_text()
-                rating_match = re.search(r'(\d+(?:\.\d+)?)', rating_text)
-                if rating_match:
-                    return float(rating_match.group(1))
-        except:
-            pass
-        return None
-    
-    def _extract_amazon_rating(self, element) -> Optional[float]:
-        """Extrae rating de Amazon"""
-        try:
-            if element:
-                text = element.get_text()
-                match = re.search(r'(\d+(?:\.\d+)?)', text)
-                if match:
-                    return float(match.group(1))
-        except:
-            pass
-        return None
-    
+
+    # --- HELPERS ---
     def _extract_text(self, element, tags: List[str], attrs=None) -> str:
-        """Extrae texto de un elemento con varios tags posibles"""
+        """Helper robusto para extraer texto"""
         try:
+            target = None
             for tag in tags:
-                if isinstance(attrs, str):
-                    el = element.find(tag, class_=re.compile(attrs))
-                elif isinstance(attrs, dict):
-                    el = element.find(tag, attrs)
+                if isinstance(attrs, dict):
+                    target = element.find(tag, attrs)
+                elif hasattr(attrs, 'search'): # es regex
+                    target = element.find(tag, class_=attrs) or element.find(tag, id=attrs)
+                elif isinstance(attrs, str):
+                    target = element.find(tag, class_=re.compile(attrs))
                 else:
-                    el = element.find(tag)
+                    target = element.find(tag)
                 
-                if el:
-                    return el.get_text(strip=True)
+                if target:
+                    return target.get_text(strip=True)
         except:
             pass
-        return ''
+        return ""
+
+    def _extract_amazon_rating(self, element) -> str:
+        try:
+            res = element.find('i', {'data-hook': 'review-star-rating'})
+            if res: return res.get_text()
+            res = element.find('span', class_='a-icon-alt')
+            if res: return res.get_text()
+        except: pass
+        return ""
 
     @staticmethod
     def _sanitize_sheet_name(name: str) -> str:
-        """
-        Limpia nombre para ser usado como nombre de hoja en Google Sheets
-        Limitaciones: Máx 100 caracteres, no permitir [] * ? : / \
-        """
-        # Caracteres prohibidos en Excel/Sheets
-        name = re.sub(r'[\[\]\*\?\:\\\/]', '', name)
-        # Eliminar saltos de línea y tabs
+        name = re.sub(r'[\[\]\*\?\:\\\/]', '', str(name))
         name = name.replace('\n', ' ').replace('\r', '').replace('\t', ' ')
-        # Truncar a 95 caracteres para dejar margen
-        if len(name) > 95:
-            name = name[:95] + "..."
+        if len(name) > 95: name = name[:95] + "..."
         return name.strip()
